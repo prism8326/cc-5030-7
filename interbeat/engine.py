@@ -25,6 +25,8 @@ import numpy as np
 from . import synth
 from .timeline import BeatMap, Clock
 
+# Evidence stages recorded by the engine. The engine never steers anything
+# from these; they are the scheduler/render side of the chain.
 MAX_VOICES = 32
 MAX_EVENTS_PER_BUFFER = 64
 START_MARGIN_BEATS = 0.25
@@ -49,6 +51,10 @@ class AudioEngine(Clock):
         self.on_hit = None  # callback(beat, inst) for UI / taps
         self.overflows = 0
         self.missed = 0
+        self.trace = None  # optional TraceRecorder; purely observational
+        self.wall_clock = None  # optional wall-time source for clock evidence
+        self.wall_stable = True  # False when wall time is a best-effort driver
+        self.placed: deque = deque(maxlen=2048)  # trace-only (beat, inst, due, placement)
         self._scheduled: deque = deque(maxlen=DEDUP_MAX)
         self._scheduled_set: set = set()
         self._active = False
@@ -86,6 +92,18 @@ class AudioEngine(Clock):
         scale = (1.0 + self.drift) / self.sr  # node-seconds per frame
         t1 = t0 + n_frames * scale
 
+        tr = self.trace
+        if tr is not None:
+            wall = None
+            if self.wall_clock is not None:
+                try:
+                    wall = self.wall_clock()
+                except Exception:
+                    wall = None
+            tr.record("clock", "tick", t=t0, wall=wall, frame=self.frame,
+                      sr=self.sr, drift=self.drift,
+                      wall_stable=self.wall_stable)
+        frame0 = self.frame
         b0 = bm.beat_at(t0)
         b1 = bm.beat_at(t1)
 
@@ -128,15 +146,32 @@ class AudioEngine(Clock):
             self._mark(eid)
             if t_ev < t0 - LATE_SECONDS:
                 self.missed += 1
+                if tr is not None:
+                    tr.record("hit", "missed", beat=beat, inst=inst,
+                              due=t_ev, buf_t0=t0, late_s=t0 - t_ev)
                 continue
             off = int(round((t_ev - t0) / scale))
             off = max(0, min(n_frames - 1, off))
+            placement = t0 + off * scale
             samples = synth.render(inst, self.sr, vel, note)
             if len(self.voices) >= MAX_VOICES:
                 self.overflows += 1
+                if tr is not None:
+                    tr.record("hit", "overflow", beat=beat, inst=inst,
+                              due=t_ev, buf_t0=t0)
                 continue
             self.voices.append((samples, -off))
             self.hit_log.append((beat, t_ev))
+            if tr is not None:
+                err_beats = None
+                if not ses.is_master and ses.filter.locked:
+                    err_beats = ses.filter.last_err
+                self.placed.append((beat, inst, t_ev, placement))
+                tr.record("hit", "trigger", beat=beat, inst=inst, eid=str(eid),
+                          due=t_ev, buf_t0=t0, buf_t1=t1, off=off,
+                          placement_t=placement, late_s=max(0.0, t0 - t_ev),
+                          map_err_beats=err_beats,
+                          tempo=ses.session_tempo)
             if self.on_hit is not None:
                 self.on_hit(beat, inst)
 
@@ -153,6 +188,11 @@ class AudioEngine(Clock):
             if pos < len(samples):
                 still.append((samples, pos))
         self.voices = still
+
+        if tr is not None and b1 > b0:
+            tr.record("render", "buffer", frame0=frame0, n=n_frames,
+                      t0=t0, t1=t1, beat0=b0, beat1=b1,
+                      active=self._active, voices=len(self.voices))
 
         self.frame += n_frames
         return out

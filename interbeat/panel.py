@@ -30,6 +30,7 @@ from .app import BeatApp
 from .measure import find_onsets
 from .page import PAGE
 from .sequencer import Step
+from .trace import TraceRecorder
 from .transport import FaultyUDPMeshTransport
 
 APP_IDS = ["A", "B", "C"]
@@ -80,18 +81,32 @@ class AppHolder:
 
 
 class Panel:
-    def __init__(self, sr=44100):
+    def __init__(self, sr=44100, trace: bool = True):
         self.sr = sr
         self.lock = threading.Lock()
         self.apps: dict[str, AppHolder] = {}
         for nid in APP_IDS:
             self.apps[nid] = AppHolder(self, nid)
+        self.trace_enabled = trace
+        self.traces: dict[str, TraceRecorder] = {}
+        self._maps = None
+        if trace:
+            for nid, h in self.apps.items():
+                rec = TraceRecorder(nid, sample_every={"clock": 5, "filter": 5})
+                # The driver loop paces the audio callback with sleeps; wall
+                # time is therefore not a trustworthy reference for the node
+                # clock, so rate/stall comparisons stay unmeasured instead of
+                # producing false drift verdicts.
+                h.app.enable_trace(rec, wall_clock=time.monotonic,
+                                   wall_stable=False)
+                self.traces[nid] = rec
         self.log: deque = deque(maxlen=80)
         self.recent_hits: dict[str, list] = {nid: [] for nid in APP_IDS}
         self.recent_audio: dict[str, deque] = {nid: deque(maxlen=200)
                                                for nid in APP_IDS}
         self.dev_samples: dict[str, deque] = {}
         self.dev_table: dict[str, dict] = {}
+        self.diag: dict = {}
         self.audio_subs: list[queue.Queue] = []
         self.state_subs: list[queue.Queue] = []
         self.running = False
@@ -116,7 +131,7 @@ class Panel:
     def _driver(self):
         n = int(self.sr * TICK)
         next_t = time.monotonic()
-        last_measure = last_state = 0.0
+        last_measure = last_state = last_diag = 0.0
         while self.running:
             next_t += TICK
             bufs = {}
@@ -135,6 +150,11 @@ class Panel:
             if now - last_measure > 0.5:
                 last_measure = now
                 self._measure()
+            if now - last_diag > 0.5:
+                # Diagnosis is deliberately slower than the UI state stream:
+                # it snapshots the trace and must not add to per-tick cost.
+                last_diag = now
+                self._diagnose()
             if now - last_state > 0.1:
                 last_state = now
                 self._push_state()
@@ -169,6 +189,7 @@ class Panel:
             for slot, b in zip(np.round(beats * 4.0) / 4.0, beats):
                 s.setdefault(float(slot), float(b))
             slots[h.id] = s
+            self._record_output_evidence(h, on, audio, f0)
         ids = sorted(slots)
         tempo = self._master_tempo()
         for i in range(len(ids)):
@@ -188,12 +209,91 @@ class Panel:
                 "p99_ms": float(np.percentile(ms, 99)),
                 "max_ms": float(ms.max())}
 
+    def _record_output_evidence(self, h, onsets_idx, audio, f0):
+        """Pair measured audible onsets with the engine's recorded placements
+        and write output-stage evidence. Read-only: it inspects the render
+        result and the trace, never the scheduling decision."""
+        rec = self.traces.get(h.id)
+        if rec is None or not onsets_idx.size:
+            return
+        eng = h.app.engine
+        scale = (1.0 + eng.drift) / self.sr
+        t_of = lambda f: eng.t0 + f * scale  # noqa: E731
+        onset_t = np.array([t_of(f) for f in (f0 + onsets_idx)])
+        placements = list(eng.placed)
+        if not placements:
+            return
+        pr_t = np.array([p[3] for p in placements])
+        pr_b = [p[0] for p in placements]
+        used = set()
+        matched = 0
+        for ot in onset_t:
+            k = int(np.argmin(np.abs(pr_t - ot)))
+            if abs(pr_t[k] - ot) > 0.06 or k in used:
+                continue
+            used.add(k)
+            rec.record("output", "onset", beat=pr_b[k],
+                       expected_t=float(pr_t[k]), measured_t=float(ot),
+                       latency_ms=float((ot - pr_t[k]) * 1000.0))
+            matched += 1
+        if matched:
+            # Drop only evidence that was matched, so an unmatched placement
+            # can still be paired on the next measurement pass. The deque is
+            # bounded, so a stuck placement cannot grow without limit.
+            keep = [p for i, p in enumerate(placements) if i not in used]
+            eng.placed.clear()
+            eng.placed.extend(keep)
+
     def _master_tempo(self):
         with self.lock:
             for h in self.apps.values():
                 if h.alive and h.app.session.is_master:
                     return h.app.session.session_tempo
         return 120.0
+
+    # ---------------------------------------------------------- diagnosis
+    def _diagnose(self):
+        """Periodic, bounded offline diagnosis of the retained evidence.
+        The result only reports; it never feeds back into scheduling."""
+        if not self.traces:
+            return
+        try:
+            from .diagnostics import diagnose, load_maps
+            from .trace import build_evidence
+            if self._maps is None:
+                self._maps = load_maps()
+            doc = build_evidence(
+                {"source": "panel"},
+                {nid: rec.snapshot(recent=300)
+                 for nid, rec in self.traces.items()})
+            res = diagnose(doc, self._maps)
+            self.diag = {
+                "ok": res["ok"],
+                "warnings": res["summary"]["warnings"],
+                "cross_end": res["summary"]["cross_end_rhythm_anomaly"],
+                "monitor": res["summary"]["monitor_sound_anomaly"],
+                "evidence_complete":
+                    res["summary"]["evidence_complete"],
+                "wall_reference": "unstable",
+                "alerts": res["summary"]["alerts"][-12:],
+                "stages": res["summary"]["stages"],
+                "nodes": {n: {"rate_ppm": r["clock"].get("rate_ppm"),
+                              "slope": r["phase"].get("slope_beats_per_s"),
+                              "triggers": r["hits"].get("triggers"),
+                              "missed": r["hits"].get("missed"),
+                              "attribution": r["attribution"]}
+                          for n, r in res["nodes"].items()},
+            }
+        except Exception as e:  # surface a broken diagnostic setup
+            self.diag = {"ok": False, "error": str(e), "cross_end": None,
+                         "monitor": None, "alerts": [], "stages": {}}
+
+    def evidence(self):
+        """Standalone, replayable evidence document for the panel run."""
+        from .trace import build_evidence
+        return build_evidence(
+            {"source": "panel", "sr": self.sr, "apps": list(self.apps)},
+            {nid: rec.snapshot() for nid, rec in self.traces.items()})
 
     # ------------------------------------------------------------ state
     def _state(self):
@@ -240,6 +340,7 @@ class Panel:
             "term": ref.app.session.term if ref else 0,
             "apps": apps, "dev": self.dev_table,
             "log": list(self.log)[-30:],
+            "diag": self.diag,
             "netstats": "  ".join(f"{k}:{v}" for k, v in net.items()),
         }
 
@@ -319,6 +420,12 @@ class Panel:
                         self.apps[nid].close()
                         self.apps[nid] = AppHolder(self, nid)
                         self.recent_audio[nid].clear()
+                        if self.trace_enabled:
+                            rec = TraceRecorder(
+                                nid, sample_every={"clock": 5, "filter": 5})
+                            self.apps[nid].app.enable_trace(
+                                rec, wall_clock=time.monotonic)
+                            self.traces[nid] = rec
                         self.add_log(f"应用 {nid} 复活（迟加入）")
                 if not dead:
                     return {"ok": False, "error": "没有离线的应用"}
@@ -391,6 +498,15 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 if q in self.panel.state_subs:
                     self.panel.state_subs.remove(q)
+        elif self.path == "/evidence":
+            body = json.dumps(self.panel.evidence(), ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="interbeat-evidence.json"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/monitor":
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")

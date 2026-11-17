@@ -84,6 +84,19 @@ PAGE = r"""<!doctype html>
         <button id="revive">复活</button></div>
       <div class="muted" id="netstats"></div>
     </div>
+    <div class="card" style="margin-top:12px"><h3>运行诊断（相位漂移 / 执行证据）</h3>
+      <div class="row"><span class="muted">运行状态</span>
+        <span id="diagRun" class="pill">–</span>
+        <span class="muted">跨端节奏</span>
+        <span id="diagCross" class="pill">–</span>
+        <span class="muted">监听声音</span>
+        <span id="diagMon" class="pill">–</span>
+      </div>
+      <div class="muted" id="diagStages"></div>
+      <div id="diagAlerts" class="muted" style="font-size:12px;margin-top:4px"></div>
+      <div class="row"><button id="exportEv">导出证据 JSON</button>
+        <span class="muted" id="evState"></span></div>
+    </div>
     <div class="card" style="margin-top:12px"><h3>内核事件 / 失败反馈</h3>
       <div id="log"></div>
     </div>
@@ -123,6 +136,18 @@ $('applyFaults').onclick = () => ctl('inject', {
   reorder: parseFloat($('reorder').value)});
 $('kill').onclick = () => ctl('kill');
 $('revive').onclick = () => ctl('revive');
+$('exportEv').onclick = async () => {
+  $('evState').textContent = '导出中…';
+  try {
+    const r = await fetch('/evidence');
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'interbeat-evidence.json';
+    a.click();
+    $('evState').textContent = '已导出，可用 beattrace diagnose 离线重放';
+  } catch (e) { $('evState').textContent = '导出失败'; }
+};
 ['loss','jitter','reorder'].forEach(id => $(id).oninput = () => {
   const v = parseFloat($(id).value);
   $(id+'V').textContent = id==='jitter' ? (v*1000).toFixed(0)+'ms' : Math.round(v*100)+'%';
@@ -152,6 +177,23 @@ function render() {
       `<tr><td>${k}</td><td>${d.n}</td><td>${d.mean_ms.toFixed(1)}ms</td>` +
       `<td>${d.p99_ms.toFixed(1)}ms</td><td>${d.max_ms.toFixed(1)}ms</td></tr>`).join('');
   $('netstats').textContent = state.netstats;
+
+  // running diagnosis: cross-end rhythm vs monitor sound, with stages
+  const dg = state.diag || {};
+  const pill = (el, on, okText, badText) => {
+    el.textContent = on === null || on === undefined ? '–' : (on ? badText : okText);
+    el.className = 'pill ' + (on ? 'bad' : (on === false ? 'on' : ''));
+  };
+  $('diagRun').textContent = dg.error ? '诊断失败' : (state.playing ? '播放中' : '停止');
+  $('diagRun').className = 'pill ' + (dg.error ? 'bad' : (state.playing ? 'on' : ''));
+  pill($('diagCross'), dg.cross_end, '正常', '异常');
+  pill($('diagMon'), dg.monitor, '正常', '异常');
+  const stages = dg.stages ? Object.entries(dg.stages)
+    .map(([s, n]) => `${s}:${n}`).join('  ') : '';
+  $('diagStages').textContent = dg.error ? ('诊断错误: ' + dg.error)
+    : (stages ? ('异常阶段  ' + stages) : '');
+  $('diagAlerts').innerHTML = (dg.alerts || []).map(a =>
+    `<div class="${a.severity === 'warn' ? 'bad' : ''}">${a.severity === 'warn' ? '!' : '·'} ${a.text}</div>`).join('');
 
   // event log
   $('log').innerHTML = state.log.map(l =>

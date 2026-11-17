@@ -97,6 +97,8 @@ class TimelineFilter:
         self.adj = 0.0
         self.saturated = False
         self.last_err = 0.0
+        self.last_delay = None  # min-link-delay estimate of the last update
+        self.last_jump_reason = None  # why the last update() hard-jumped
         self._fresh = False  # first sample after (re)adoption not yet verified
 
     def reset(self, keep_lock: bool = False) -> None:
@@ -142,6 +144,7 @@ class TimelineFilter:
         if not self.samples:
             return False
         recv, send, beat, tempo = min(self.samples, key=lambda s: s[0] - s[1])
+        self.last_delay = recv - send
         # Extrapolate the master's beat position to now. The unknown clock
         # offset cancels; the residual error is the min link delay.
         target_beat = beat + (now - recv) * tempo / 60.0
@@ -152,6 +155,7 @@ class TimelineFilter:
             self.err_int = 0.0
             self.adj = 0.0
             self._fresh = False
+            self.last_jump_reason = "initial_lock"
             return True
         err = target_beat - beatmap.beat_at(now)
         if self._fresh:
@@ -164,6 +168,7 @@ class TimelineFilter:
                 self.base_tempo = tempo
                 self.err_int = 0.0
                 self.adj = 0.0
+                self.last_jump_reason = "adopt_relock"
                 return True
         if tempo != self.base_tempo:
             # Session tempo changed: adopt the new rate continuously (the map

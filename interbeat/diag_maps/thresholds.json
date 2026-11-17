@@ -1,0 +1,70 @@
+{
+  "thresholds": {
+    "ms": {
+      "map_error": 12.0,
+      "schedule_late": 5.0,
+      "audio_latency": 25.0
+    },
+    "phase": {
+      "jump_beats": 0.02,
+      "drift_min_beats": 0.10,
+      "drift_band_beats": 0.02,
+      "err_slope_beats_per_s": 0.02,
+      "drift_ppm": 20.0,
+      "ramp_min_duration_s": 3.0
+    },
+    "clock": {
+      "stall_ms": 50.0
+    },
+    "evidence": {
+      "max_events": 200000
+    }
+  },
+  "causes": {
+    "map_error": {
+      "stage": "clock/filter",
+      "label": "时钟映射误差",
+      "note": "本地节拍映射与主时钟网格的相位差，触发时直接反映在实际时刻上"
+    },
+    "schedule_late": {
+      "stage": "schedule",
+      "label": "调度迟到",
+      "note": "事件应触发时刻早于本缓冲区起点，放置被夹到缓冲区首帧"
+    },
+    "audio_latency": {
+      "stage": "output",
+      "label": "音频输出延迟",
+      "note": "实测起音相对放置时刻的输出链路延迟"
+    },
+    "phase_drift": {
+      "stage": "clock/filter",
+      "label": "相位漂移",
+      "note": "节拍相位相对主时钟的持续偏差"
+    },
+    "tempo_ramp": {
+      "stage": "clock/filter",
+      "label": "渐变速度/时钟漂移",
+      "note": "相位误差单向累积，由速度渐变或时钟速率偏差缓慢造成"
+    },
+    "phase_jump": {
+      "stage": "map",
+      "label": "节拍相位突跳",
+      "note": "相位误差单次阶跃，来自重锁或显式相位跳变"
+    },
+    "missed_trigger": {
+      "stage": "schedule",
+      "label": "漏触发",
+      "note": "事件超出迟到容忍窗口，未进入调度"
+    },
+    "clock_stall": {
+      "stage": "clock",
+      "label": "时钟停顿",
+      "note": "节点时钟未跟上墙钟，音频渲染停顿"
+    },
+    "unmeasured": {
+      "stage": "evidence",
+      "label": "缺少测量",
+      "note": "该阶段没有证据，指标留空而非记零"
+    }
+  }
+}

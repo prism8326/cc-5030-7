@@ -21,6 +21,18 @@ class BeatApp:
         self.session.on_map_jump = self.engine.reset_watermark
         self._user_on_event = on_event
 
+    def enable_trace(self, recorder, wall_clock=None,
+                     wall_stable=True) -> None:
+        """Attach an observational TraceRecorder to both components. This
+        changes no playback decision; callers may pass a wall-clock source so
+        clock evidence can be checked against reference time. Set
+        wall_stable=False when wall time is a best-effort driver loop rather
+        than a true reference, so rate comparisons are not trusted."""
+        self.engine.trace = recorder
+        self.session.trace = recorder
+        self.engine.wall_clock = wall_clock
+        self.engine.wall_stable = wall_stable
+
     def _on_event(self, kind: str, **kw) -> None:
         self.events.append((kind, kw))
         if len(self.events) > 512:

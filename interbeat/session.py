@@ -53,6 +53,7 @@ class Session:
         self.play_beat = 0.0  # shared beat at which current play state began
 
         self.peers: dict[str, dict] = {}  # node -> {name, last_seen}
+        self.trace = None  # optional TraceRecorder; observational only
         self._last_hello = -1e9
         self._last_beacon = -1e9
         self._last_tick: float | None = None
@@ -72,8 +73,12 @@ class Session:
             return False
         bpm = max(30.0, min(300.0, float(bpm)))
         if bpm != self.session_tempo:
+            prev = self.session_tempo
             self.session_tempo = bpm
             self.tempo_seq += 1
+            if self.trace is not None:
+                self.trace.record("tempo", "change", old=prev, new=bpm,
+                                  seq=self.tempo_seq, t=self.clock.now())
         return True
 
     def request_play(self, playing: bool) -> float | None:
@@ -106,6 +111,10 @@ class Session:
         now = self.clock.now()
         self.beatmap.jump(now, self.beatmap.beat_at(now) + beats,
                           self.beatmap.tempo)
+        if self.trace is not None:
+            self.trace.record("map", "jump", reason="nudge", t=now,
+                              beats=beats, beat=self.beatmap.beat_at(now),
+                              tempo=self.beatmap.tempo)
         self._beacon(now, hard=True)
 
     # ----------------------------------------------------------------- tick
@@ -145,6 +154,19 @@ class Session:
             jumped = self.filter.update(self.beatmap, now, dt)
             if jumped and self.on_map_jump:
                 self.on_map_jump()
+            if jumped and self.trace is not None:
+                self.trace.record(
+                    "map", "jump",
+                    reason=self.filter.last_jump_reason or "relock", t=now,
+                    beat=self.beatmap.beat_at(now),
+                    tempo=self.beatmap.tempo)
+            if self.trace is not None:
+                self.trace.record(
+                    "filter", "estimate", t=now, err_beats=self.filter.last_err,
+                    adj=self.filter.adj, base_tempo=self.filter.base_tempo,
+                    locked=self.filter.locked,
+                    saturated=self.filter.saturated,
+                    link_delay_s=self.filter.last_delay)
             if self.filter.saturated:
                 if not self._sat_reported:
                     self._sat_reported = True
@@ -195,7 +217,12 @@ class Session:
                 # extrapolate wrongly, drop them from the min-delay window.
                 self.filter.samples.clear()
             if tempo_seq > self.tempo_seq:
+                old = self.session_tempo
                 self.session_tempo = float(msg["tempo"])
+                if self.trace is not None and self.session_tempo != old:
+                    self.trace.record("tempo", "change", old=old,
+                                      new=self.session_tempo, seq=tempo_seq,
+                                      t=now, adopted=True)
             self.tempo_seq = max(self.tempo_seq, tempo_seq)
             if msg.get("hard") and phase_seq > self.phase_seq:
                 self.filter.reset()  # deliberate jump: re-lock hard
@@ -222,8 +249,14 @@ class Session:
         self.play_seq = max(self.play_seq, seq)
         if playing != self.playing:
             self.on_event("play_state", playing=playing, beat=beat)
+        elif self.play_beat != beat and self.trace is not None:
+            self.trace.record("play", "boundary", t=self.clock.now(),
+                              playing=playing, beat=beat, seq=seq)
         self.playing = playing
         self.play_beat = beat
+        if self.trace is not None:
+            self.trace.record("play", "state", t=self.clock.now(),
+                              playing=playing, beat=beat, seq=seq)
 
     def _apply_master(self, term: int, master_id: str) -> None:
         was_master = self.is_master
@@ -247,6 +280,11 @@ class Session:
                 # Re-key the filter onto the new master's sample stream;
                 # keep the current map so the handover does not glitch.
                 self.filter.reset(keep_lock=True)
+        if self.trace is not None:
+            self.trace.record("master", "change", t=self.clock.now(),
+                              master_id=self.master_id, term=self.term,
+                              is_master=self.is_master,
+                              was_master=was_master)
 
     def _elect(self) -> None:
         winner = min([self.node_id] + list(self.peers))
